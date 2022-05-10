@@ -17,6 +17,7 @@ const (
 
 type manifestItem struct {
 	Config       string
+	RepoDigests  []string `json:",omitempty"`
 	RepoTags     []string
 	Layers       []string
 	Parent       image.ID                                 `json:",omitempty"`

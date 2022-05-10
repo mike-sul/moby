@@ -129,6 +129,19 @@ func (l *tarexporter) Load(inTar io.ReadCloser, outStream io.Writer, quiet bool)
 		imageIDsStr += fmt.Sprintf("Loaded image ID: %s\n", imgID)
 
 		imageRefCount = 0
+
+		for _, repoDigest := range m.RepoDigests {
+			digested, err := reference.ParseNormalizedNamed(repoDigest)
+			if err != nil {
+				return err
+			}
+			ref, ok := digested.(reference.Canonical)
+			if !ok {
+				return fmt.Errorf("invalid digested reference %q", repoDigest)
+			}
+			l.rs.AddDigest(ref, imgID.Digest(), true)
+		}
+
 		for _, repoTag := range m.RepoTags {
 			named, err := reference.ParseNormalizedNamed(repoTag)
 			if err != nil {
