@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strings"
 
 	"github.com/containerd/log"
 	"github.com/distribution/reference"
@@ -26,6 +27,7 @@ import (
 	"github.com/moby/sys/sequential"
 	"github.com/moby/sys/symlink"
 	"github.com/opencontainers/go-digest"
+	"github.com/sirupsen/logrus"
 )
 
 func (l *tarexporter) Load(inTar io.ReadCloser, outStream io.Writer, quiet bool) error {
@@ -68,11 +70,9 @@ func (l *tarexporter) Load(inTar io.ReadCloser, outStream io.Writer, quiet bool)
 	}
 
 	var parentLinks []parentLink
-	var imageIDsStr string
-	var imageRefCount int
 
 	for _, m := range manifest {
-		configPath, err := safePath(tmpDir, m.Config)
+		configPath, err := safePathWithTmp(m.LayersRoot, tmpDir, m.Config)
 		if err != nil {
 			return err
 		}
@@ -95,7 +95,7 @@ func (l *tarexporter) Load(inTar io.ReadCloser, outStream io.Writer, quiet bool)
 		}
 
 		for i, diffID := range img.RootFS.DiffIDs {
-			layerPath, err := safePath(tmpDir, m.Layers[i])
+			layerPath, err := safePathWithTmp(m.LayersRoot, tmpDir, m.Layers[i])
 			if err != nil {
 				return err
 			}
@@ -119,25 +119,30 @@ func (l *tarexporter) Load(inTar io.ReadCloser, outStream io.Writer, quiet bool)
 		if err != nil {
 			return err
 		}
-		imageIDsStr += fmt.Sprintf("Loaded image ID: %s\n", imgID)
-
-		imageRefCount = 0
+		var imageRefs []string
 		for _, repoTag := range m.RepoTags {
 			named, err := reference.ParseNormalizedNamed(repoTag)
 			if err != nil {
-				return err
+				return fmt.Errorf("invalid image reference: %s", repoTag)
 			}
-			ref, ok := named.(reference.NamedTagged)
-			if !ok {
-				return fmt.Errorf("invalid tag %q", repoTag)
+			if refSetErr := l.setLoadedNamedRef(named, imgID.Digest(), outStream); refSetErr == nil {
+				imageRefs = append(imageRefs, reference.FamiliarString(named))
+			} else {
+				logrus.Warnf("failed to set loaded image reference: %s", refSetErr.Error())
 			}
-			l.setLoadedTag(ref, imgID.Digest(), outStream)
-			outStream.Write([]byte(fmt.Sprintf("Loaded image: %s\n", reference.FamiliarString(ref))))
-			imageRefCount++
 		}
 
 		parentLinks = append(parentLinks, parentLink{imgID, m.Parent})
 		l.loggerImgEvent.LogImageEvent(imgID.String(), imgID.String(), events.ActionLoad)
+		var imageIDsStr string
+		if len(imageRefs) > 0 {
+			imageIDsStr = fmt.Sprintf("Image loaded; refs: %s", strings.Join(imageRefs, ", "))
+		} else {
+			imageIDsStr = fmt.Sprintf("Image loaded; ID: %s", imgID)
+		}
+		if _, writeErr := outStream.Write([]byte(imageIDsStr)); writeErr != nil {
+			logrus.Warnf("failed to output loaded image IDs: %s", writeErr.Error())
+		}
 	}
 
 	for _, p := range validatedParentLinks(parentLinks) {
@@ -146,10 +151,6 @@ func (l *tarexporter) Load(inTar io.ReadCloser, outStream io.Writer, quiet bool)
 				return err
 			}
 		}
-	}
-
-	if imageRefCount == 0 {
-		outStream.Write([]byte(imageIDsStr))
 	}
 
 	return nil
@@ -205,12 +206,19 @@ func (l *tarexporter) loadLayer(filename string, rootFS image.RootFS, id string,
 	return l.lss.Register(inflatedLayerData, rootFS.ChainID())
 }
 
-func (l *tarexporter) setLoadedTag(ref reference.Named, imgID digest.Digest, outStream io.Writer) error {
+func (l *tarexporter) setLoadedNamedRef(ref reference.Named, imgID digest.Digest, outStream io.Writer) error {
 	if prevID, err := l.rs.Get(ref); err == nil && prevID != imgID {
 		fmt.Fprintf(outStream, "The image %s already exists, renaming the old one with ID %s to empty string\n", reference.FamiliarString(ref), string(prevID)) // todo: this message is wrong in case of multiple tags
 	}
-
-	return l.rs.AddTag(ref, imgID, true)
+	switch specificRef := ref.(type) {
+	case reference.NamedTagged:
+		l.rs.AddTag(specificRef, imgID, true)
+	case reference.Canonical:
+		l.rs.AddDigest(specificRef, imgID, true)
+	default:
+		return fmt.Errorf("unsupported image reference type: %s", ref.String())
+	}
+	return nil
 }
 
 func (l *tarexporter) legacyLoad(tmpDir string, outStream io.Writer, progressOutput progress.Output) error {
@@ -264,7 +272,7 @@ func (l *tarexporter) legacyLoad(tmpDir string, outStream io.Writer, progressOut
 			if err != nil {
 				return err
 			}
-			l.setLoadedTag(ref, imgID.Digest(), outStream)
+			l.setLoadedNamedRef(ref, imgID.Digest(), outStream)
 		}
 	}
 
@@ -371,6 +379,14 @@ func (l *tarexporter) legacyLoadImage(oldID, sourceDir string, loadedMap map[str
 
 func safePath(base, path string) (string, error) {
 	return symlink.FollowSymlinkInScope(filepath.Join(base, path), base)
+}
+
+func safePathWithTmp(rootDir, tmp, path string) (string, error) {
+	root := rootDir
+	if len(root) == 0 {
+		root = tmp
+	}
+	return symlink.FollowSymlinkInScope(filepath.Join(root, path), root)
 }
 
 type parentLink struct {
