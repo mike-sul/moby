@@ -354,12 +354,12 @@ func (ls *layerStore) registerWithDescriptor(ts io.Reader, parent ChainID, descr
 	}
 
 	if layer.size > 0 {
-		logrus.Infof("Syncing filesystem prior to committing the layer...; "+
+		log.G(context.TODO()).Infof("Syncing filesystem prior to committing the layer...; "+
 			"size: %d, chain ID: %s, cache ID: %s", layer.size, layer.chainID, layer.cacheID)
 		// Prior to committing the layer ensure the extracted layer files are saved to disk
 		syscall.Sync()
 	}
-	logrus.Infof("Committing layer %s", layer.chainID)
+	log.G(context.TODO()).Infof("Committing layer %s", layer.chainID)
 	if cErr = tx.Commit(layer.chainID); cErr != nil {
 		return nil, cErr
 	}
